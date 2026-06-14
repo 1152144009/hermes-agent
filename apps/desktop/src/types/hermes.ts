@@ -225,6 +225,10 @@ export interface ModelOptionProvider {
   key_env?: string
   /** True for providers defined via the user's `providers:` config block. */
   is_user_defined?: boolean
+  /** Per-model display labels keyed by model id. When a gateway exposes a
+   *  ``display_name`` (e.g. "Auto (网关自动挑选)"), the picker renders this
+   *  label while still selecting the canonical model id. */
+  model_labels?: Record<string, string>
   /** Per-model pricing keyed by model id (present when the picker requested
    *  pricing and the provider supports live pricing). */
   pricing?: Record<string, ModelPricing>

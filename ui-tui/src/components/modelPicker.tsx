@@ -103,8 +103,11 @@ export function ModelPicker({ allowPersistGlobal = true, gw, onCancel, onSelect,
       return allModels
     }
 
-    return fuzzyRank(allModels, filter, m => m).map(r => r.item)
-  }, [allModels, filter, stage])
+    return fuzzyRank(allModels, filter, m => {
+      const label = provider?.model_labels?.[m] ?? m
+      return `${m} ${label}`
+    }).map(r => r.item)
+  }, [allModels, filter, stage, provider])
 
   const models = filteredModels
 
@@ -592,6 +595,7 @@ export function ModelPicker({ allowPersistGlobal = true, gw, onCancel, onSelect,
       {Array.from({ length: VISIBLE }, (_, i) => {
         const row = items[i]
         const idx = offset + i
+        const label = provider?.model_labels?.[row] ?? row
 
         if (!row) {
           return (!allModels.length || noModelMatches) && i === 0 ? (
@@ -616,7 +620,7 @@ export function ModelPicker({ allowPersistGlobal = true, gw, onCancel, onSelect,
             wrap="truncate-end"
           >
             {prefix}
-            {idx + 1}. {row}
+            {idx + 1}. {label}
           </Text>
         )
       })}

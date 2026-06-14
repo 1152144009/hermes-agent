@@ -379,6 +379,7 @@ export interface ModelOptionProvider {
   authenticated?: boolean
   is_current?: boolean
   key_env?: string
+  model_labels?: Record<string, string>
   models?: string[]
   name: string
   slug: string

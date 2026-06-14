@@ -22,6 +22,11 @@ from hermes_cli import __version__ as _HERMES_VERSION
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
 _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 
+# Per-provider display labels discovered from live /v1/models endpoints.
+# Key: canonical provider slug; value: {model_id: human-friendly label}.
+# Populated for Anthropic-compatible gateways that advertise ``display_name``.
+_PROVIDER_MODEL_LABELS: dict[str, dict[str, str]] = {}
+
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
 COPILOT_EDITOR_VERSION = "vscode/1.104.1"
@@ -2219,7 +2224,14 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             pass
     if normalized == "anthropic":
         live = _fetch_anthropic_models()
+        custom_base_url = _get_custom_base_url()
         if live:
+            # When the user has configured a custom Anthropic-compatible base_url
+            # (e.g. a self-hosted gateway), trust the live list verbatim. The
+            # static curated catalog only makes sense for the official Anthropic
+            # API where newer aliases may appear before /v1/models lists them.
+            if custom_base_url:
+                return live
             # The live /v1/models dump lags newly-routed curated aliases
             # (e.g. claude-fable-5, which is reachable on Anthropic before it
             # is enumerated by the models endpoint). Surface curated entries
@@ -2477,6 +2489,9 @@ def cached_provider_model_ids(
 
     Hits the cache when fresh; otherwise calls the live function and
     persists a non-empty result. Always returns a list (never None).
+    Display labels discovered from Anthropic-compatible custom gateways are
+    persisted alongside the model list so the picker can render friendly names
+    even on a warm cache.
     """
     normalized = normalize_provider(provider) or (provider or "")
     if not normalized:
@@ -2495,6 +2510,7 @@ def cached_provider_model_ids(
         and entry["models"]
         and (now - float(entry.get("at", 0))) < ttl_seconds
     ):
+        _restore_provider_model_labels(normalized, entry)
         return list(entry["models"])
 
     # Cache miss / stale / forced refresh — call the live path.
@@ -2505,6 +2521,13 @@ def cached_provider_model_ids(
             "at": now,
             "models": list(live),
         }
+        labels = _PROVIDER_MODEL_LABELS.get(normalized)
+        if isinstance(labels, dict) and labels:
+            cache[normalized]["labels"] = labels
+            # Labels are gateway-specific for Anthropic; pin them to the
+            # configured base_url so they don't leak after switching endpoints.
+            if normalized == "anthropic":
+                cache[normalized]["base_url"] = _get_custom_base_url()
         _save_provider_models_cache(cache)
         return list(live)
 
@@ -2517,8 +2540,22 @@ def cached_provider_model_ids(
         and isinstance(entry.get("models"), list)
         and entry["models"]
     ):
+        _restore_provider_model_labels(normalized, entry)
         return list(entry["models"])
     return list(live or [])
+
+
+def _restore_provider_model_labels(provider: str, entry: dict) -> None:
+    """Restore display labels from a cache entry when the endpoint matches."""
+    labels = entry.get("labels")
+    if not isinstance(labels, dict) or not labels:
+        return
+    # For Anthropic custom gateways, only restore labels that were cached
+    # against the same base_url; otherwise stale gateway labels could show
+    # on the official Anthropic endpoint.
+    if provider == "anthropic" and entry.get("base_url") != _get_custom_base_url():
+        return
+    _provider_model_labels_set(provider, labels)
 
 
 def clear_provider_models_cache(provider: Optional[str] = None) -> None:
@@ -2533,12 +2570,14 @@ def clear_provider_models_cache(provider: Optional[str] = None) -> None:
             path = _provider_models_cache_path()
             if path.exists():
                 path.unlink()
+            _PROVIDER_MODEL_LABELS.clear()
             return
         cache = _load_provider_models_cache()
         normalized = normalize_provider(provider) or provider or ""
         if normalized in cache:
             del cache[normalized]
             _save_provider_models_cache(cache)
+        _PROVIDER_MODEL_LABELS.pop(normalized, None)
     except Exception:
         pass
 
@@ -2548,6 +2587,13 @@ def _fetch_anthropic_models(timeout: float = 5.0) -> Optional[list[str]]:
 
     Uses resolve_anthropic_token() to find credentials (env vars or
     Claude Code auto-discovery).  Returns sorted model IDs or None.
+
+    If the user has configured a custom base_url in config.yaml (e.g. a
+    self-hosted Anthropic-compatible gateway), probe that endpoint first and
+    fall back to the official Anthropic API only when the custom probe fails.
+    Custom gateway responses may include a ``display_name`` for each model;
+    when present, the label is stored via ``get_provider_model_labels()`` so
+    the model picker can render friendly names instead of bare IDs.
     """
     try:
         from agent.anthropic_adapter import resolve_anthropic_token, _is_oauth_token
@@ -2567,17 +2613,80 @@ def _fetch_anthropic_models(timeout: float = 5.0) -> Optional[list[str]]:
     else:
         headers["x-api-key"] = token
 
-    def _do_request(h: dict[str, str]):
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/models",
-            headers=h,
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+    # Labels are gateway-specific; clear stale ones before fetching so the
+    # picker never shows custom labels after the user switches back to the
+    # official Anthropic endpoint.
+    _provider_model_labels_set("anthropic", {})
 
+    def _do_request(base_url: str, h: dict[str, str]):
+        # Anthropic-compatible gateways often expose /v1/models at the root
+        # of the Messages API base (e.g. https://host/coding/v1/models).
+        # Try that first, then fall back to appending /models to the raw base.
+        candidates = []
+        normalized = base_url.rstrip("/")
+        if normalized.endswith("/v1"):
+            candidates.append(normalized + "/models")
+            candidates.append(normalized[:-3].rstrip("/") + "/models")
+        else:
+            candidates.append(normalized + "/v1/models")
+            candidates.append(normalized + "/models")
+        last_err = None
+        for url in candidates:
+            req = urllib.request.Request(url, headers=h)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode())
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err or urllib.error.HTTPError(
+            candidates[0], 404, "not found", None, None
+        )
+
+    def _sort_models(models: list[str]) -> list[str]:
+        """Sort: latest/largest first (opus > sonnet > haiku, higher version first)."""
+        return sorted(models, key=lambda m: (
+            "opus" not in m,      # opus first
+            "sonnet" not in m,    # then sonnet
+            "haiku" not in m,     # then haiku
+            m,                    # alphabetical within tier
+        ))
+
+    def _extract_labels(data: Any) -> dict[str, str]:
+        """Build {model_id: display_label} from a /v1/models response."""
+        labels: dict[str, str] = {}
+        for item in data.get("data", []) if isinstance(data, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            mid = item.get("id")
+            if not mid:
+                continue
+            label = str(item.get("display_name") or "").strip()
+            labels[str(mid)] = label if label else str(mid)
+        return labels
+
+    # Prefer the user's configured custom Anthropic-compatible endpoint.
+    custom_base_url = _get_custom_base_url()
+    if custom_base_url:
+        try:
+            data = _do_request(custom_base_url, headers)
+            labels = _extract_labels(data)
+            models = list(labels.keys())
+            if models:
+                _provider_model_labels_set("anthropic", labels)
+                return _sort_models(models)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug(
+                "Failed to fetch models from custom Anthropic base_url %s: %s",
+                custom_base_url, e,
+            )
+
+    # Fall back to the official Anthropic API. We intentionally do NOT store
+    # labels here so the native Anthropic picker keeps showing curated IDs.
     try:
         try:
-            data = _do_request(headers)
+            data = _do_request("https://api.anthropic.com/v1", headers)
         except urllib.error.HTTPError as http_err:
             # Reactive recovery for OAuth subscriptions that reject the 1M
             # context beta with 400 "long context beta is not yet available
@@ -2596,23 +2705,33 @@ def _fetch_anthropic_models(timeout: float = 5.0) -> Optional[list[str]]:
                         [b for b in _COMMON_BETAS if b != _CONTEXT_1M_BETA]
                         + list(_OAUTH_ONLY_BETAS)
                     )
-                    data = _do_request(headers)
+                    data = _do_request("https://api.anthropic.com/v1", headers)
                 else:
                     raise
             else:
                 raise
         models = [m["id"] for m in data.get("data", []) if m.get("id")]
-        # Sort: latest/largest first (opus > sonnet > haiku, higher version first)
-        return sorted(models, key=lambda m: (
-            "opus" not in m,      # opus first
-            "sonnet" not in m,    # then sonnet
-            "haiku" not in m,     # then haiku
-            m,                    # alphabetical within tier
-        ))
+        return _sort_models(models)
     except Exception as e:
         import logging
         logging.getLogger(__name__).debug("Failed to fetch Anthropic models: %s", e)
         return None
+
+
+def _provider_model_labels_set(provider: str, labels: dict[str, str]) -> None:
+    """Store display labels for a canonical provider slug."""
+    _PROVIDER_MODEL_LABELS[normalize_provider(provider)] = dict(labels)
+
+
+def get_provider_model_labels(provider: str) -> dict[str, str]:
+    """Return display labels discovered from a provider's live /models endpoint.
+
+    Currently populated for Anthropic-compatible custom gateways that advertise
+    ``display_name`` in their ``/v1/models`` response. Labels are keyed by
+    model ID so pickers can render the friendly name while still selecting the
+    canonical ID.
+    """
+    return dict(_PROVIDER_MODEL_LABELS.get(normalize_provider(provider), {}))
 
 
 def _payload_items(payload: Any) -> list[dict[str, Any]]:

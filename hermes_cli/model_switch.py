@@ -1239,7 +1239,7 @@ def list_authenticated_providers(
     from hermes_cli.models import (
         OPENROUTER_MODELS, _PROVIDER_MODELS,
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
-        get_curated_nous_model_ids,
+        get_curated_nous_model_ids, get_provider_model_labels,
     )
 
     results: List[dict] = []
@@ -2019,6 +2019,14 @@ def list_authenticated_providers(
             })
             seen_slugs.add(slug.lower())
             _section4_emitted_slugs.add(slug.lower())
+
+    # Attach any live-discovered display labels (e.g. Anthropic-compatible
+    # gateway ``display_name`` values) so interactive pickers can render
+    # friendly model names while still selecting canonical IDs.
+    for row in results:
+        labels = get_provider_model_labels(row["slug"])
+        if labels:
+            row["model_labels"] = labels
 
     # Sort: current provider first, then by model count descending
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))

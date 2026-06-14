@@ -192,11 +192,16 @@ function ModelResults({
 
   const q = search.trim().toLowerCase()
 
-  const matches = (provider: ModelOptionProvider, model: string) =>
-    !q ||
-    model.toLowerCase().includes(q) ||
-    provider.name.toLowerCase().includes(q) ||
-    provider.slug.toLowerCase().includes(q)
+  const matches = (provider: ModelOptionProvider, model: string) => {
+    if (!q) return true
+    const label = provider.model_labels?.[model] ?? model
+    return (
+      model.toLowerCase().includes(q) ||
+      label.toLowerCase().includes(q) ||
+      provider.name.toLowerCase().includes(q) ||
+      provider.slug.toLowerCase().includes(q)
+    )
+  }
 
   // Only configured providers (those with curated models) are selectable
   // here. Switching to a NOT-yet-configured provider goes through the
@@ -228,6 +233,7 @@ function ModelResults({
               const isCurrent = model === currentModel && provider.slug === currentProvider
               const price = provider.pricing?.[model]
               const locked = unavailable.has(model)
+              const displayLabel = provider.model_labels?.[model] ?? model
 
               return (
                 <CommandItem
@@ -246,7 +252,7 @@ function ModelResults({
                   }}
                   value={`${provider.slug}:${model}`}
                 >
-                  <span className="min-w-0 flex-1 truncate">{model}</span>
+                  <span className="min-w-0 flex-1 truncate">{displayLabel}</span>
                   {locked && <span className="shrink-0 text-[0.62rem] uppercase tracking-wide opacity-80">{copy.pro}</span>}
                   <ModelPrice isCurrent={isCurrent} price={price} />
                 </CommandItem>
